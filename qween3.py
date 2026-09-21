@@ -1,88 +1,139 @@
 #%%
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import DocArrayInMemorySearch,Chroma
-from langchain_community.embeddings import OllamaEmbeddings
-
-
-#%%
-
+from pypdf import PdfReader
+import chromadb
 import ollama
 
-# 1. Configuration
-PDF_PATH = "data/JournalArabe0892026.pdf"
-EMBEDDING_MODEL = "bge-m3"      # Excellent for Arabic and multilingual text
-LLM_MODEL = "qwen3:4b"            # Or any model fluent in Arabic (e.g., mistral, custom models)
-CHUNK_SIZE = 500                # Character length per text chunk
-
-# 2. Extract and Chunk Text from Arabic PDF
-def extract_chunks_from_pdf(pdf_path="data/JournalArabe0892026.pdf"):
-    loader = PyPDFLoader(pdf_path)
-    docs = loader.load_and_split()
-    return docs
-
-docs = extract_chunks_from_pdf(PDF_PATH)
-
-print(docs)
-#%%
-# 3. Generate Embeddings for Document Chunks
-print("جاري إنشاء المتجهات نصوص الملف...")
-
-embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-
-store = DocArrayInMemorySearch.from_documents(docs, embedding=embeddings)
-store_chroma = Chroma.from_documents(docs, embeddings)
-retriever = store.as_retriever()
-chroma_store = store_chroma.as_retriever(search_kwargs={"k": 3})
+PDF_PATH = "data/قانون-عدد-112-لسنة-1983-المؤرخ-في-12-ديسمبر-1983.pdf"
+EMBEDDING_MODEL = "bge-m3"
+MODEL= "qwen3:4b"
 #%%
 
 
 
+reader = PdfReader(PDF_PATH)
 
-# 5. Live RAG Chat Query Execution
-def ask_rag(user_query,with_chroma=False):
-    # Step A: Get relevant context in Arabic
-    context = retriever.invoke(user_query)
-    print(f"this is context : {context} \n\n" )
+documents = []
+metadatas = []
+ids = []
 
-    chroma_context = chroma_store.invoke(user_query)
 
-    print(f"this is chroma context : {chroma_context} \n\n" )
-    if with_chroma:
-        system_prompt = (
-                    "أنت مساعد ذكي ومحترف. استخدم السياق المرفق فقط للإجابة على سؤال المستخدم بشكل دقيق ومباشر. "
-                    "إذا لم تجد الإجابة في السياق، قل 'لا أملك هذه المعلومة في المستندات المتاحة'.\n\n"
-                    " أريد الإجابة بالعربي \n\n"
-                    f"السياق المتاح:\n{chroma_context}"
-                )
-    else:
-    
-        system_prompt = (
-            "أنت مساعد ذكي ومحترف. استخدم السياق المرفق فقط للإجابة على سؤال المستخدم بشكل دقيق ومباشر. "
-            "إذا لم تجد الإجابة في السياق، قل 'لا أملك هذه المعلومة في المستندات المتاحة'.\n\n"
-            " أريد الإجابة بالعربي \n\n"
-            f"السياق المتاح:\n{context}"
-        )
-    
-    # Step C: Use 'from ollama import chat' API 
-    response = ollama.chat(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query}
-        ],
-        think='low',
-        options={"temperature": 0.4} # Lower temperature for more factual retrieval adherence
+chunk_id = 0
+for page_num, page in enumerate(reader.pages):
+    text = page.extract_text()
+    if text:
+        # Découpage simple par paragraphe/bloc pour conserver les articles intacts
+        paragraphs = text.split("\n\n")
+        for para in paragraphs:
+            cleaned_para = para.strip()
+            if len(cleaned_para) > 50:  # Filtrer les fragments trop petits
+                documents.append(cleaned_para)
+                metadatas.append({"page": page_num + 1})
+                ids.append(f"doc_chunk_{chunk_id}")
+                chunk_id += 1
+
+print(f"Nombre de segments extraits du PDF : {len(documents)}")
+
+# 2. Génération des Embeddings & stockage dans ChromaDB
+chroma_client = chromadb.Client()
+collection = chroma_client.get_or_create_collection(name="loi_fonction_publique_ar")
+
+# Fonction pour obtenir des vector embeddings 
+def get_embedding(text: str) -> list[float]:
+    response = ollama.embed(
+        model= EMBEDDING_MODEL,
+        input=text
     )
+
+    return response['embeddings'][0]
+
+print("Indexation des segments dans la base vectorielle...")
+# Génération et insertion par lots
+embeddings = [get_embedding(doc) for doc in documents]
+
+collection.add(
+    documents=documents,
+    embeddings=embeddings,
+    metadatas=metadatas,
+    ids=ids
+)
+print("Indexation terminée !")
+
+#%%
+
+chroma_client = chromadb.Client()
+collection = chroma_client.get_or_create_collection(name="loi_fonction_publique_ar")
+
+def get_embedding(text: str) -> list[float]:
+    response = ollama.embed(
+        model= EMBEDDING_MODEL,
+        input=text
+    )
+
+    return response['embeddings'][0]
+
+def repondre_question_rag(question: str) -> str:
+
+    query_embedding = get_embedding(question)
+
     
+
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=3
+    )
+
+    print(f'Result with embedding : {results}')
+
+
+    results = collection.query(
+        query_texts=[question],
+        n_results=3
+    )
+
+    print(f'Result with text : {results}')
+
+
+    retrieved_docs = results["documents"][0]
+    context = "\n\n---\n\n".join(retrieved_docs)
+
+    print(context)
+
+    
+
+    prompt = f"""أنت مساعد قانوني متخصص في القانون الإداري التونسي. أجب عن السؤال بناءً **فقط حصرياً** على مقتطفات النص أدناه. إذا لم تجد الإجابة هناك، قل ببساطة إن المعلومة غير متوفرة في هذه الوثيقة.
+
+        السياق القانوني المستخرج من ملف الـ PDF:
+        {context}
+
+        السؤال: {question}
+
+        الإجابة:"""
+    
+
+    response = ollama.chat(model='qwen3:4b',
+                           messages=[
+                                {
+                                    'role': 'user',
+                                    'content': prompt,
+                                }],
+                            options={'temperature': 0.2}
+                        )
+    
+
     return response['message']['content']
 
-#%%
-arabic_query = "تاريخ فتح مناظرة داخلية بالملــفات للترقــية إلى رتـــبة  قيم عام أول فوق الرتبة بعنوان 2026 "
-print(f"\nالسؤال: {arabic_query} \n\n")
+# 4. مثال على الاستخدام
+question = "ما هي شروط عطلة بعث مؤسسة؟"
+print(f"\nالسؤال: {question}\n")
 
-answer = ask_rag(arabic_query)
-print(f"\nالإجابة:\n{answer}")
+reponse = repondre_question_rag(question)
+print("إجابة نظام RAG:")
+print(reponse)
 
+
+## https://index.jort.tn/
+## https://lake.jort.tn/journal-officiel/ar/2026/001.pdf
+## https://lake.jort.tn/journal-officiel/fr/2025/156.pdf
+
+## https://ocr.jort.tn/journal-officiel/fr/2025/156.md
 # %%
-answer = ask_rag(arabic_query,True)
-print(f"\nالإجابة:\n{answer}")
